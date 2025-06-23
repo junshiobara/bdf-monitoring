@@ -1,0 +1,17 @@
+# 機密情報を除外
+credentials/
+*.env
+token.json
+credentials.json
+
+# Python関連
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.log
+
+# データファイル
+bdf_gmail_api_data.json
+bdf_notifications_data.json
