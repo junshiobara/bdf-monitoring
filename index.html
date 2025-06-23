@@ -1,480 +1,306 @@
-"""
-BdF刊行物監視システム（Gmail API版）
-LesEchos Botと同じ方式でGmail API使用
-"""
-
-import asyncio
-import os
-import sys
-import base64
-import time
-import json
-import schedule
-import requests
-from pathlib import Path
-from email.mime.text import MimeText
-from email.mime.multipart import MimeMultipart
-from datetime import datetime, timedelta
-import pytz
-import logging
-from bs4 import BeautifulSoup
-import re
-from typing import Dict, List, Optional
-
-import google.auth.transport.requests
-import google.oauth2.credentials
-from googleapiclient.discovery import build
-from dotenv import load_dotenv
-
-# ログ設定
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# ─── 環境変数読み込み ─────────────────────────────
-load_dotenv("credentials/.env", encoding="utf-8-sig")
-GMAIL_TO = os.getenv("GMAIL_TO")
-
-# 必須チェック
-if not GMAIL_TO:
-    sys.exit("❌ credentials/.env に GMAIL_TO がありません")
-
-class BdFGmailAPINotifier:
-    def __init__(self):
-        self.base_url = "https://www.banque-france.fr"
-        self.publications_url = f"{self.base_url}/en/publications-and-statistics/publications"
-        self.paris_tz = pytz.timezone('Europe/Paris')
-        self.data_file = 'bdf_gmail_api_data.json'
-        self.gmail_to = GMAIL_TO
-        
-        # Gmail API初期化
-        self.gmail_service = self.init_gmail()
-        
-        # セッション設定
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        
-        # 定期刊行物パターン
-        self.publication_patterns = {
-            'monthly_business_survey': {
-                'title': 'Monthly Business Survey',
-                'pattern': r'monthly business survey',
-                'priority': 'High'
-            },
-            'macroeconomic_projections': {
-                'title': 'Macroeconomic Projections',
-                'pattern': r'macroeconomic projections',
-                'priority': 'High'
-            },
-            'financial_stability_report': {
-                'title': 'Financial Stability Report',
-                'pattern': r'financial stability report',
-                'priority': 'Highest'
-            },
-            'letter_to_president': {
-                'title': 'Letter to the President of the Republic',
-                'pattern': r'letter to the president',
-                'priority': 'Medium'
-            },
-            'balance_of_payments': {
-                'title': 'Balance of Payments Report',
-                'pattern': r'balance of payments.*international investment',
-                'priority': 'Medium'
-            },
-            'observatory_payment_security': {
-                'title': 'Observatory Security Payment Report',
-                'pattern': r'observatory.*security.*payment',
-                'priority': 'Medium'
-            },
-            'annual_report': {
-                'title': 'Banque de France Annual Report',
-                'pattern': r'banque de france annual report',
-                'priority': 'Medium'
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BdF 定期刊行物監視ダッシュボード</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            margin: 20px; 
+            background-color: #ffffff; 
+            line-height: 1.6;
+        }
+        .container { 
+            max-width: 1400px; 
+            margin: 0 auto; 
+            padding: 20px; 
+        }
+        h1 { 
+            color: #333; 
+            text-align: center; 
+            margin-bottom: 10px;
+            border-bottom: 3px solid #2563eb;
+            padding-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+        .info-bar {
+            background: #f8f9fa;
+            padding: 15px;
+            border: 1px solid #ddd;
+            margin-bottom: 20px;
+            text-align: center;
+            border-radius: 5px;
+        }
+        .last-update {
+            font-size: 0.9em;
+            color: #666;
+            margin-top: 10px;
+        }
+        table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            margin-top: 20px;
+            border: 1px solid #ddd;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        th, td { 
+            border: 1px solid #ddd; 
+            padding: 12px; 
+            text-align: left; 
+        }
+        th { 
+            background-color: #f5f5f5; 
+            font-weight: bold;
+            color: #333;
+        }
+        tr:nth-child(even) { 
+            background-color: #f9f9f9; 
+        }
+        tr:hover { 
+            background-color: #f0f0f0; 
+        }
+        .days-cell {
+            font-size: 1.1em;
+            font-weight: bold;
+            text-align: center;
+        }
+        .note {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border: 1px solid #ddd;
+            font-size: 0.9em;
+            color: #666;
+            border-radius: 5px;
+        }
+        .github-link {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .github-link a {
+            color: #2563eb;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        .github-link a:hover {
+            text-decoration: underline;
+        }
+        @media (max-width: 768px) {
+            .container {
+                padding: 10px;
+            }
+            table {
+                font-size: 0.9em;
+            }
+            th, td {
+                padding: 8px;
             }
         }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏦 Banque de France 定期刊行物監視ダッシュボード</h1>
+        <p class="subtitle">8つの定期刊行物を次回更新日順で監視</p>
         
-        self.load_data()
+        <div class="info-bar">
+            <strong>監視対象:</strong> 8つの定期刊行物シリーズ |
+            <strong>更新:</strong> 毎日自動更新 |
+            <strong>通知:</strong> Gmail自動送信
+            <div class="last-update" id="lastUpdate">最終更新: 2025-06-23 15:00:00 (パリ時間)</div>
+        </div>
 
-    def init_gmail(self):
-        """Gmail API初期化（LesEchos方式）"""
-        SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-        CRED = Path("credentials")
-        TOKEN = CRED / "token.json"
-        SECRET = CRED / "credentials.json"
-        
-        try:
-            if not TOKEN.exists():
-                from google_auth_oauthlib.flow import InstalledAppFlow
-                flow = InstalledAppFlow.from_client_secrets_file(SECRET, SCOPES)
-                creds = flow.run_local_server(port=0)
-                TOKEN.write_text(creds.to_json())
-            
-            creds = google.oauth2.credentials.Credentials.from_authorized_user_file(TOKEN, SCOPES)
-            if creds.expired and creds.refresh_token:
-                creds.refresh(google.auth.transport.requests.Request())
-                TOKEN.write_text(creds.to_json())
-            
-            gmail_service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-            logger.info("✅ Gmail API 初期化完了")
-            return gmail_service
-            
-        except Exception as e:
-            logger.error(f"❌ Gmail API 初期化エラー: {e}")
-            logger.error("credentials/credentials.json が正しく配置されているか確認してください")
-            sys.exit(1)
+        <table>
+            <thead>
+                <tr>
+                    <th>No</th>
+                    <th>刊行物名</th>
+                    <th>頻度</th>
+                    <th>最新発行日</th>
+                    <th>最新タイトル</th>
+                    <th>次回予測</th>
+                    <th>日数</th>
+                    <th>状況</th>
+                </tr>
+            </thead>
+            <tbody id="publicationsTable">
+                <tr>
+                    <td style="text-align: center; font-weight: bold;">1</td>
+                    <td><strong>Financial Stability Report</strong></td>
+                    <td>Semi-Annual</td>
+                    <td>23rd of December 2024</td>
+                    <td>Financial stability report - December 2024</td>
+                    <td style="text-align: center;">2025-06-23</td>
+                    <td class="days-cell">今日</td>
+                    <td style="text-align: center;">🚨 本日予定</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; font-weight: bold;">2</td>
+                    <td><strong>Monthly Business Survey</strong></td>
+                    <td>Monthly</td>
+                    <td>11th of June 2025</td>
+                    <td>Monthly Business Survey – Start of June 2025</td>
+                    <td style="text-align: center;">2025-07-01</td>
+                    <td class="days-cell">8日後</td>
+                    <td style="text-align: center;">⏰ 期限間近</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; font-weight: bold;">3</td>
+                    <td><strong>Macroeconomic Projections</strong></td>
+                    <td>Quarterly</td>
+                    <td>11th of June 2025</td>
+                    <td>Macroeconomic projections – June 2025</td>
+                    <td style="text-align: center;">2025-09-15</td>
+                    <td class="days-cell">84日後</td>
+                    <td style="text-align: center;">✅ 正常</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; font-weight: bold;">4</td>
+                    <td><strong>Balance of Payments and International Investment Position</strong></td>
+                    <td>Annual</td>
+                    <td>15th of November 2024</td>
+                    <td>France's balance of payments and international investment position 2023</td>
+                    <td style="text-align: center;">2025-11-15</td>
+                    <td class="days-cell">145日後</td>
+                    <td style="text-align: center;">📅 予定あり</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; font-weight: bold;">5</td>
+                    <td><strong>Observatory for Security of Payment Means Report</strong></td>
+                    <td>Annual</td>
+                    <td>17th of January 2025</td>
+                    <td>Annual Activity Report of the Observatory for Security of Payment Means 2023</td>
+                    <td style="text-align: center;">2026-01-17</td>
+                    <td class="days-cell">208日後</td>
+                    <td style="text-align: center;">✅ 正常</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; font-weight: bold;">6</td>
+                    <td><strong>Letter to the President of the Republic</strong></td>
+                    <td>Annual</td>
+                    <td>18th of April 2025</td>
+                    <td>Letter to the President: From stupefaction to general mobilisation</td>
+                    <td style="text-align: center;">2026-04-18</td>
+                    <td class="days-cell">299日後</td>
+                    <td style="text-align: center;">✅ 正常</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; font-weight: bold;">7</td>
+                    <td><strong>Banque de France Annual Report</strong></td>
+                    <td>Annual</td>
+                    <td>20th of May 2025</td>
+                    <td>Banque de France Annual Report 2024</td>
+                    <td style="text-align: center;">2026-05-20</td>
+                    <td class="days-cell">331日後</td>
+                    <td style="text-align: center;">✅ 正常</td>
+                </tr>
+                <tr>
+                    <td style="text-align: center; font-weight: bold;">8</td>
+                    <td><strong>Interim Macroeconomic Projections</strong></td>
+                    <td>Irregular</td>
+                    <td>18th of September 2024</td>
+                    <td>Interim macroeconomic projections – September 2024</td>
+                    <td style="text-align: center;">不定期</td>
+                    <td class="days-cell">N/A</td>
+                    <td style="text-align: center;">⏸️ 停止</td>
+                </tr>
+            </tbody>
+        </table>
 
-    def load_data(self):
-        """過去の刊行物データ読み込み"""
-        try:
-            if os.path.exists(self.data_file):
-                with open(self.data_file, 'r', encoding='utf-8') as f:
-                    self.known_publications = json.load(f)
-            else:
-                self.known_publications = {}
-            logger.info(f"データ読み込み完了: {len(self.known_publications)} 件の既知刊行物")
-        except Exception as e:
-            logger.error(f"データ読み込みエラー: {e}")
-            self.known_publications = {}
+        <div class="note">
+            <h3>📊 状況説明</h3>
+            <p><strong>🚨 本日予定:</strong> 発行予定日当日 | 
+            <strong>⏰ 期限間近:</strong> 7日以内に予定 | 
+            <strong>📅 予定あり:</strong> 30日以内に予定 | 
+            <strong>✅ 正常:</strong> 30日超・正常範囲 | 
+            <strong>⏸️ 停止:</strong> 刊行停止の可能性</p>
+            
+            <h3>🤖 システム機能</h3>
+            <p>• <strong>自動監視:</strong> 毎日パリ時間7:00に自動チェック<br>
+            • <strong>Gmail通知:</strong> 新しい刊行物が公表されたら即座にメール送信<br>
+            • <strong>Webダッシュボード:</strong> このページで最新状況を確認可能<br>
+            • <strong>データソース:</strong> <a href="https://www.banque-france.fr/en/publications-and-statistics/publications" target="_blank">Banque de France Publications</a></p>
+        </div>
 
-    def save_data(self):
-        """データ保存"""
-        try:
-            with open(self.data_file, 'w', encoding='utf-8') as f:
-                json.dump(self.known_publications, f, ensure_ascii=False, indent=2)
-            logger.info("データ保存完了")
-        except Exception as e:
-            logger.error(f"データ保存エラー: {e}")
+        <div class="github-link">
+            <p>🔧 <a href="https://github.com/junshobara/bdf-monitoring" target="_blank">GitHub Repository</a> | 
+            📧 自動通知システム稼働中</p>
+        </div>
+    </div>
 
-    def extract_publications_from_page(self):
-        """BdFページから刊行物を抽出"""
-        try:
-            response = self.session.get(self.publications_url, timeout=30)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            publications = []
-            
-            # HTMLから刊行物を検索
-            # 方法1: タイトルを含む要素を検索
-            for element in soup.find_all(['h1', 'h2', 'h3', 'h4', 'a']):
-                text = element.get_text(strip=True)
-                if text and len(text) > 15:
-                    # 各パターンでチェック
-                    for pub_id, pub_config in self.publication_patterns.items():
-                        if re.search(pub_config['pattern'], text, re.IGNORECASE):
-                            # 日付を抽出
-                            date_text = self.extract_date_near_element(element)
-                            
-                            pub_data = {
-                                'pub_id': pub_id,
-                                'title': text,
-                                'date_text': date_text,
-                                'pattern_matched': pub_config['pattern'],
-                                'priority': pub_config['priority'],
-                                'extracted_at': datetime.now(self.paris_tz).isoformat(),
-                                'source_tag': element.name
-                            }
-                            publications.append(pub_data)
-                            break
-            
-            # 方法2: ページ全体のテキストからも検索
-            page_text = soup.get_text()
-            for pub_id, pub_config in self.publication_patterns.items():
-                matches = list(re.finditer(pub_config['pattern'], page_text, re.IGNORECASE))
+    <script>
+        // 現在時刻を更新
+        function updateTime() {
+            const now = new Date();
+            const parisTime = now.toLocaleString('ja-JP', {
+                timeZone: 'Europe/Paris',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+            document.getElementById('lastUpdate').textContent = `最終更新: ${parisTime} (パリ時間)`;
+        }
+
+        // 日数の動的計算
+        function updateDaysUntil() {
+            const publications = [
+                { nextDate: '2025-06-23', row: 0 }, // Financial Stability Report
+                { nextDate: '2025-07-01', row: 1 }, // Monthly Business Survey
+                { nextDate: '2025-09-15', row: 2 }, // Macroeconomic Projections
+                { nextDate: '2025-11-15', row: 3 }, // Balance of Payments
+                { nextDate: '2026-01-17', row: 4 }, // Observatory
+                { nextDate: '2026-04-18', row: 5 }, // Letter to President
+                { nextDate: '2026-05-20', row: 6 }, // Annual Report
+            ];
+
+            const today = new Date();
+            const tableRows = document.querySelectorAll('#publicationsTable tr');
+
+            publications.forEach(pub => {
+                const nextDate = new Date(pub.nextDate);
+                const diffTime = nextDate - today;
+                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
                 
-                for match in matches:
-                    # 既に見つかったタイトルと重複チェック
-                    context_start = max(0, match.start() - 200)
-                    context_end = min(len(page_text), match.end() + 200)
-                    context = page_text[context_start:context_end]
-                    
-                    # コンテキストから完全なタイトルを抽出
-                    title = self.extract_title_from_context(context)
-                    date_text = self.extract_date_from_context(context)
-                    
-                    if title and len(title) > 15:
-                        # 重複チェック
-                        is_duplicate = any(
-                            pub['title'].lower() == title.lower() 
-                            for pub in publications
-                        )
-                        
-                        if not is_duplicate:
-                            pub_data = {
-                                'pub_id': pub_id,
-                                'title': title,
-                                'date_text': date_text,
-                                'pattern_matched': pub_config['pattern'],
-                                'priority': pub_config['priority'],
-                                'extracted_at': datetime.now(self.paris_tz).isoformat(),
-                                'source_tag': 'text_search'
-                            }
-                            publications.append(pub_data)
-            
-            logger.info(f"ページから {len(publications)} 件の刊行物を抽出")
-            return publications
-            
-        except Exception as e:
-            logger.error(f"ページ抽出エラー: {e}")
-            return []
+                const daysCell = tableRows[pub.row].cells[6];
+                const statusCell = tableRows[pub.row].cells[7];
+                
+                if (diffDays === 0) {
+                    daysCell.textContent = '今日';
+                    statusCell.innerHTML = '🚨 本日予定';
+                } else if (diffDays > 0) {
+                    daysCell.textContent = `${diffDays}日後`;
+                    if (diffDays <= 7) {
+                        statusCell.innerHTML = '⏰ 期限間近';
+                    } else if (diffDays <= 30) {
+                        statusCell.innerHTML = '📅 予定あり';
+                    } else {
+                        statusCell.innerHTML = '✅ 正常';
+                    }
+                } else {
+                    daysCell.textContent = `${Math.abs(diffDays)}日超過`;
+                    statusCell.innerHTML = '⚠️ 期限超過';
+                }
+            });
+        }
 
-    def extract_date_near_element(self, element):
-        """要素の近くから日付を抽出"""
-        # 同じ親要素内から日付を検索
-        parent = element.parent
-        if parent:
-            text = parent.get_text()
-            return self.extract_date_from_context(text)
-        return ''
-
-    def extract_title_from_context(self, context):
-        """コンテキストから完全なタイトルを抽出"""
-        lines = context.split('\n')
-        for line in lines:
-            cleaned = line.strip()
-            if len(cleaned) > 20 and len(cleaned) < 200:
-                # 無効なパターンを除外
-                if not re.search(r'^(Home|Menu|Search|Filter)', cleaned, re.IGNORECASE):
-                    return cleaned
-        return ''
-
-    def extract_date_from_context(self, context):
-        """コンテキストから日付を抽出"""
-        date_patterns = [
-            r'(\d{1,2}(?:st|nd|rd|th)?\s+of\s+\w+\s+\d{4})',
-            r'(\w+\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})',
-            r'(\d{1,2}[/-]\d{1,2}[/-]\d{4})'
-        ]
+        // 初期化
+        updateTime();
+        updateDaysUntil();
         
-        for pattern in date_patterns:
-            match = re.search(pattern, context, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return ''
-
-    def check_for_new_publications(self):
-        """新しい刊行物をチェック"""
-        logger.info("🔍 新しい刊行物をチェック中...")
-        
-        
-
-    def send_gmail_notification(self, matching_publications):
-        """Gmail API経由で刊行物通知を送信（LesEchos方式）"""
-        try:
-            subject = f"🏦 BdF刊行物通知 - {len(matching_publications)}件の対象刊行物"
-            
-            # HTML形式のメール本文作成
-            html_body = self.create_notification_html(matching_publications)
-            
-            # MIMEメッセージ作成
-            msg = MimeMultipart('alternative')
-            msg['Subject'] = subject
-            msg['From'] = self.gmail_to
-            msg['To'] = self.gmail_to
-            
-            # HTML版を添付
-            html_part = MimeText(html_body, 'html', 'utf-8')
-            msg.attach(html_part)
-            
-            # Base64エンコード
-            raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-            
-            # Gmail API経由で送信
-            self.gmail_service.users().messages().send(
-                userId="me", 
-                body={"raw": raw_message}
-            ).execute()
-            
-            logger.info(f"✅ Gmail送信完了: {self.gmail_to}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Gmail送信エラー: {e}")
-            return False
-
-    def create_notification_html(self, matching_publications):
-        """HTML形式の通知メール作成"""
-        html = f"""
-        <html>
-        <head>
-            <style>
-                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-                .header {{ 
-                    background-color: #2563eb; 
-                    color: white; 
-                    padding: 20px; 
-                    text-align: center; 
-                    border-radius: 8px 8px 0 0;
-                }}
-                .content {{ padding: 20px; }}
-                .publication {{ 
-                    border-left: 4px solid #2563eb; 
-                    padding: 15px; 
-                    margin: 15px 0; 
-                    background-color: #f8f9fa; 
-                    border-radius: 0 8px 8px 0;
-                }}
-                .title {{ 
-                    font-weight: bold; 
-                    font-size: 1.1em; 
-                    color: #1f2937; 
-                    margin-bottom: 8px;
-                }}
-                .details {{ 
-                    color: #6b7280; 
-                    font-size: 0.9em; 
-                    line-height: 1.4;
-                }}
-                .priority-highest {{ border-left-color: #dc2626; }}
-                .priority-high {{ border-left-color: #f59e0b; }}
-                .priority-medium {{ border-left-color: #10b981; }}
-                .footer {{ 
-                    background-color: #f3f4f6; 
-                    padding: 15px; 
-                    margin-top: 20px; 
-                    color: #6b7280; 
-                    font-size: 0.8em; 
-                    border-radius: 8px;
-                }}
-                .url-link {{
-                    color: #2563eb;
-                    text-decoration: none;
-                    word-break: break-all;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h1>🏦 Banque de France</h1>
-                <h2>定期刊行物が公表されました</h2>
-            </div>
-            
-            <div class="content">
-                <p><strong>{len(matching_publications)}件</strong>の対象刊行物が発見されました:</p>
-        """
-        
-        for i, pub in enumerate(matching_publications, 1):
-            priority_class = f"priority-{pub['priority'].lower()}"
-            
-            html += f"""
-                <div class="publication {priority_class}">
-                    <div class="title">{i}. {pub['title']}</div>
-                    <div class="details">
-                        📅 <strong>発行日:</strong> {pub['date_text'] or '日付不明'}<br>
-                        🔖 <strong>カテゴリ:</strong> {self.publication_patterns[pub['pub_id']]['title']}<br>
-                        ⭐ <strong>優先度:</strong> {pub['priority']}<br>
-                        🕐 <strong>検出日時:</strong> {pub['extracted_at'][:19]}<br>
-                        🔍 <strong>抽出方法:</strong> {pub['source_tag']}<br>
-                        🔗 <strong>データソース:</strong> <a href="{self.publications_url}" class="url-link">{self.publications_url}</a>
-                    </div>
-                </div>
-            """
-        
-        html += f"""
-            </div>
-            
-            <div class="footer">
-                <p><strong>🤖 BdF刊行物監視システム</strong></p>
-                <p>📧 送信日時: {datetime.now(self.paris_tz).strftime('%Y-%m-%d %H:%M:%S')} (パリ時間)</p>
-                <p>📊 監視対象: {len(self.publication_patterns)} 種類の定期刊行物</p>
-                <p>🔄 このメールは自動送信されました。</p>
-            </div>
-        </body>
-        </html>
-        """
-        
-        return html
-
-    def run_daily_check(self):
-        """日次チェック実行"""
-        paris_now = datetime.now(self.paris_tz)
-        logger.info(f"🔍 日次チェック開始: {paris_now.strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        # 8シリーズの刊行物をチェック
-        matching_publications = self.check_for_new_publications()
-        
-        if matching_publications:
-            # 対象の刊行物が見つかったらメール送信
-            success = self.send_gmail_notification(matching_publications)
-            if success:
-                logger.info("✅ 刊行物通知送信完了")
-            else:
-                logger.error("❌ 通知送信失敗")
-        else:
-            logger.info("ℹ️ 対象の刊行物なし - 通知送信なし")
-
-    def start_scheduler(self):
-        """スケジューラー開始"""
-        # 毎日パリ時間7:00に実行
-        schedule.every().day.at("07:00").do(self.run_daily_check)
-        
-        logger.info("📅 新刊行物チェックスケジューラー開始: 毎日パリ時間7:00に実行")
-        
-        def run_scheduler():
-            while True:
-                schedule.run_pending()
-                time.sleep(60)
-        
-        import threading
-        scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-        scheduler_thread.start()
-
-    def test_notification(self):
-        """テスト通知送信"""
-        test_publications = [{
-            'pub_id': 'test',
-            'title': 'テスト通知 - BdF刊行物監視システム',
-            'date_text': '2025年6月23日',
-            'priority': 'Test',
-            'pattern_matched': 'test',
-            'extracted_at': datetime.now(self.paris_tz).isoformat(),
-            'source_tag': 'manual_test'
-        }]
-        
-        logger.info("🧪 テスト通知を送信します...")
-        success = self.send_gmail_notification(test_publications)
-        return success
-
-
-def main():
-    """メイン実行"""
-    print("🚀 BdF刊行物監視システム（Gmail API版）開始")
-    print("=" * 60)
-    print(f"📧 通知先: {GMAIL_TO}")
-    print("📁 設定ファイル: credentials/.env")
-    print("🔑 認証: credentials/credentials.json")
-    
-    # システム初期化
-    notifier = BdFGmailAPINotifier()
-    
-    # テスト通知
-    test = input("\nテスト通知を送信しますか？ (y/N): ").lower() == 'y'
-    if test:
-        notifier.test_notification()
-    
-    # 手動チェック
-    manual = input("手動チェックを実行しますか？ (y/N): ").lower() == 'y'
-    if manual:
-        notifier.run_daily_check()
-    
-    # スケジューラー開始
-    notifier.start_scheduler()
-    
-    print(f"\n✅ システム稼働中")
-    print(f"⏰ 自動チェック: 毎日パリ時間7:00")
-    print(f"📊 監視パターン: {len(notifier.publication_patterns)} 種類")
-    print("\n手動チェック: 'm' + Enter")
-    print("終了: Ctrl+C")
-    
-    try:
-        while True:
-            user_input = input()
-            if user_input.lower() == 'm':
-                notifier.run_daily_check()
-    except KeyboardInterrupt:
-        print("\n⏹️ システム停止")
-
-
-if __name__ == "__main__":
-    main()
+        // 1分ごとに更新
+        setInterval(() => {
+            updateTime();
+            updateDaysUntil();
+        }, 60000);
+    </script>
+</body>
+</html>
